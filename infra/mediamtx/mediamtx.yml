@@ -1,0 +1,46 @@
+# MediaMTX configuration for Seance v2 on Railway
+# Non-negotiable: NO public UDP, NO SRT, NO WebRTC/WHEP.
+# Ingest: RTSP-over-TCP on :8554 (via Railway TCP Proxy)
+# Egress: Low-Latency HLS (fMP4 10-bit HEVC + AAC) on :8888 (via Railway HTTPS)
+
+logLevel: info
+logDestinations: [stdout]
+
+# Disable UDP / WebRTC / RTMP listeners
+srt: no
+webrtc: no
+rtmp: no
+
+# Enable TCP-only RTSP ingest
+rtsp: yes
+rtspTransports: [tcp]
+rtspAddress: :8554
+
+# Enable Low-Latency fMP4 HLS egress
+hls: yes
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsAlwaysRemux: yes
+hlsAllowOrigin: "*"
+
+# Default auth: override in Railway via MTX_AUTHINTERNALUSERS_* env vars
+authMethod: internal
+authInternalUsers:
+  - user: seance_ingest
+    pass: change_me_in_railway
+    ips: []
+    permissions:
+      - action: publish
+        path:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: read
+        path:
+
+paths:
+  all_others:
