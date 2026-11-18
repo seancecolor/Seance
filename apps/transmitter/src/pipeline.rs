@@ -1,6 +1,7 @@
 use crate::config::{TelemetrySnapshot, TransmitterConfig};
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_video as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -61,7 +62,7 @@ fn make_elem(factory: &str, name: &str) -> Result<gst::Element, String> {
         .map_err(|e| format!("Missing GStreamer element `{factory}`: {e}"))
 }
 
-fn first_available_factory(candidates: &[&str]) -> Option<&'static str> {
+fn first_available_factory<'a>(candidates: &[&'a str]) -> Option<&'a str> {
     for &name in candidates {
         if gst::ElementFactory::find(name).is_some() {
             return Some(name);
