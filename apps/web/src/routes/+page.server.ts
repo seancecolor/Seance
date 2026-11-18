@@ -4,14 +4,12 @@ import { signRoomToken, verifyRoomToken } from '$lib/server/zoomAuth';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ locals, url }) => {
-	const hlsOrigin = (
-		publicEnv.PUBLIC_MEDIAMTX_HLS_ORIGIN || 'https://stream.visitantmedia.com'
-	).replace(/\/+$/, '');
 	const streamPath = (publicEnv.PUBLIC_MEDIAMTX_STREAM_PATH || 'cleanfeed').replace(
 		/^\/+|\/+$/g,
 		''
 	);
-	const hlsUrl = `${hlsOrigin}/${streamPath}/index.m3u8`;
+	// Use same-origin /hls proxy so MediaMTX session cookies & CORS work in all browsers/Zoom WebView
+	const hlsUrl = `/hls/${streamPath}/index.m3u8`;
 
 	const signingSecret = env.ROOM_SIGNING_SECRET || 'dev_local_signing_secret_change_in_prod';
 	const queryRoom = url.searchParams.get('room');
