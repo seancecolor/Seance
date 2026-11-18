@@ -17,7 +17,7 @@ Seance/
 │   ├── transmitter/      # Local Linux Rust GUI + GStreamer 10-bit DeckLink transmitter
 │   └── web/              # SvelteKit (Svelte 5) web player, WS chat/canvas server, Zoom SDK bridge
 └── infra/
-    └── mediamtx/         # Dockerfile & Railway config for bluenviron/mediamtx:1.21.3
+    └── mediamtx/         # Dockerfile & Railway config for bluenviron/mediamtx:1.19.2
 ```
 
 ---
@@ -36,7 +36,7 @@ Seance/
   - Live telemetry readout (pipeline state, negotiated caps/fps, reconnect backoff) + localhost HTTP webhook (`127.0.0.1:9944/toggle` and `/slate`) for hardware Stream Deck / OpenDeck triggers.
 
 ## Component 2: `infra/mediamtx` (Railway Media Router)
-- **Base Image:** `bluenviron/mediamtx:1.21.3`
+- **Base Image:** `bluenviron/mediamtx:1.19.2`
 - **Configuration (`mediamtx.yml` + env overrides):**
   - Disable UDP listeners: `srt: no`, `webrtc: no`, `rtmp: no`.
   - Enable TCP ingest: `rtsp: yes`, `rtspTransports: [tcp]`, `rtspAddress: :8554` (exposed via Railway TCP Proxy).
@@ -71,7 +71,7 @@ Seance/
   - Live telemetry readout (pipeline state, negotiated caps/fps, reconnect backoff) + localhost HTTP webhook (`127.0.0.1:9944/toggle` and `/slate`) for hardware Stream Deck / OpenDeck triggers.
 
 ## Component 2: `infra/mediamtx` (Railway Media Router)
-- **Base Image:** `bluenviron/mediamtx:1.21.3`
+- **Base Image:** `bluenviron/mediamtx:1.19.2`
 - **Configuration (`mediamtx.yml` + env overrides):**
   - Disable UDP listeners: `srt: no`, `webrtc: no`, `rtmp: no`.
   - Enable TCP ingest: `rtsp: yes`, `rtspTransports: [tcp]`, `rtspAddress: :8554` (exposed via Railway TCP Proxy).

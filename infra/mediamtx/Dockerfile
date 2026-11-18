@@ -1,4 +1,4 @@
-FROM bluenviron/mediamtx:1.21.3
+FROM bluenviron/mediamtx:1.19.2
 
 COPY infra/mediamtx/mediamtx.yml /mediamtx.yml
 
