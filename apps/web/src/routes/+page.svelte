@@ -140,7 +140,7 @@
 <div class="app-layout">
 	<header class="top-bar">
 		<div class="brand">
-			<strong>SEANCE v2</strong>
+			<strong>SEANCE</strong>
 			<span class="room-pill">Room: {data.roomId}</span>
 			<span class="mode-pill">{zoom.inZoom ? 'Zoom App' : 'Standalone Browser'}</span>
 		</div>

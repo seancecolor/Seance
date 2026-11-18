@@ -1,4 +1,4 @@
-# Seance v2 — Local Linux Transmitter (`apps/transmitter`)
+# Seance — Local Linux Transmitter (`apps/transmitter`)
 
 Native Rust (`eframe`/`egui`) + GStreamer (`0.25.4`) desktop control panel for capturing 10-bit SDI from a Blackmagic DeckLink Mini Recorder 4K, encoding `P010_10LE` `bt709` HEVC `main-10` via `nvh265enc`, and pushing via interleaved **RTSP-over-TCP** to MediaMTX on Railway.
 

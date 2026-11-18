@@ -2,7 +2,7 @@
 name = "seance-transmitter"
 version = "0.2.0"
 edition = "2024"
-description = "Seance v2 local Linux 10-bit DeckLink -> GStreamer NVENC HEVC -> RTSP-over-TCP transmitter GUI"
+description = "Seance local Linux 10-bit DeckLink -> GStreamer NVENC HEVC -> RTSP-over-TCP transmitter GUI"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }

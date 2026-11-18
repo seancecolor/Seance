@@ -1,4 +1,4 @@
-# Seance v2 — Web Player, WebSocket Server & Zoom App (`apps/web`)
+# Seance — Web Player, WebSocket Server & Zoom App (`apps/web`)
 
 SvelteKit (Svelte 5) frontend + Node WebSocket server (`/ws`) + `hls.js` (`^1.7.4` full build) + `@zoom/appssdk` (`^0.16.43`).
 

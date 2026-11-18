@@ -1,4 +1,4 @@
-# Seance v2 — MediaMTX on Railway
+# Seance — MediaMTX on Railway
 
 Zero-transcode media router (`bluenviron/mediamtx:1.21.3`) accepting 10-bit HEVC + AAC over **RTSP-over-TCP** (`:8554`) and serving **Low-Latency HLS (`fMP4`)** over HTTP (`:8888`).
 

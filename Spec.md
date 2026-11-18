@@ -1,4 +1,4 @@
-# Project: Seance v2 — 10-Bit Remote Color Grading Suite (DeckLink -> Railway -> Zoom App)
+# Project: Seance — 10-Bit Remote Color Grading Suite (DeckLink -> Railway -> Zoom App)
 
 ## Architectural Constraints (Non-Negotiable)
 1. **No WebRTC SFUs / No Public UDP on Railway:** Railway only exposes HTTP/WebSockets (`443`) and a single raw TCP Proxy port. Do NOT configure SRT or WebRTC/WHEP over public UDP.
@@ -12,7 +12,7 @@
 ## Monorepo Layout
 
 ```text
-seance-v2/
+Seance/
 ├── apps/
 │   ├── transmitter/      # Local Linux Rust GUI + GStreamer 10-bit DeckLink transmitter
 │   └── web/              # SvelteKit (Svelte 5) web player, WS chat/canvas server, Zoom SDK bridge

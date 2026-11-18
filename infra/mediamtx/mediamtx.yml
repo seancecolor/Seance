@@ -1,4 +1,4 @@
-# MediaMTX configuration for Seance v2 on Railway
+# MediaMTX configuration for Seance on Railway
 # Non-negotiable: NO public UDP, NO SRT, NO WebRTC/WHEP.
 # Ingest: RTSP-over-TCP on :8554 (via Railway TCP Proxy)
 # Egress: Low-Latency HLS (fMP4 10-bit HEVC + AAC) on :8888 (via Railway HTTPS)

@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use webhook::run_webhook_server;
 
 #[derive(Parser, Debug)]
-#[command(name = "seance-transmitter", about = "Seance v2 10-bit DeckLink -> Railway transmitter")]
+#[command(name = "seance-transmitter", about = "Seance 10-bit DeckLink -> Railway transmitter")]
 struct CliArgs {
     /// Use GStreamer videotestsrc/audiotestsrc instead of physical DeckLink hardware
     #[arg(long, default_value_t = false)]
@@ -36,7 +36,7 @@ impl eframe::App for TransmitterApp {
         *self.latest_cfg.lock().unwrap() = self.cfg.clone();
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("SEANCE v2 // 10-BIT TRANSMITTER");
+            ui.heading("SEANCE // 10-BIT TRANSMITTER");
             ui.label("DeckLink SDI -> P010 BT.709 -> NVENC HEVC Main10 -> RTSP-over-TCP");
             ui.add_space(10.0);
 
@@ -190,12 +190,12 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([640.0, 460.0])
-            .with_title("Seance v2 Transmitter"),
+            .with_title("Seance Transmitter"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Seance v2 Transmitter",
+        "Seance Transmitter",
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
