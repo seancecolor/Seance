@@ -174,12 +174,19 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     let audio_sel = make_elem("input-selector", "audio_sel")?;
 
     // --- 10-bit HEVC NVENC Encode + AAC + RTSP-over-TCP Sink ---
+    // Lock resolution/fps before nvh265enc so caps changes from DeckLink or
+    // input-selector never trigger gst_nv_encoder_reset() inside libnvidia-encode.
     let v_enc_conv = make_elem("videoconvert", "v_enc_conv")?;
+    let v_enc_scale = make_elem("videoscale", "v_enc_scale")?;
+    let v_enc_rate = make_elem("videorate", "v_enc_rate")?;
     let v_enc_caps = make_elem("capsfilter", "v_enc_caps")?;
     v_enc_caps.set_property(
         "caps",
         &gst::Caps::builder("video/x-raw")
             .field("format", "P010_10LE")
+            .field("width", width)
+            .field("height", height)
+            .field("framerate", gst::Fraction::new(fps_n, fps_d))
             .field("colorimetry", "bt709")
             .build(),
     );
@@ -232,6 +239,8 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
             &video_sel,
             &audio_sel,
             &v_enc_conv,
+            &v_enc_scale,
+            &v_enc_rate,
             &v_enc_caps,
             &v_enc,
             &h265_caps,
@@ -304,6 +313,8 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     gst::Element::link_many([
         &video_sel,
         &v_enc_conv,
+        &v_enc_scale,
+        &v_enc_rate,
         &v_enc_caps,
         &v_enc,
         &h265_caps,
