@@ -6,17 +6,25 @@ Native Rust (`eframe`/`egui`) + GStreamer (`0.25.4`) desktop control panel for c
 ```bash
 sudo dnf install gstreamer1-devel gstreamer1-plugins-base-devel \
   gstreamer1-plugins-bad-free-devel gstreamer1-plugins-good \
-  gstreamer1-plugins-bad-free gstreamer1-rtsp-server-devel
+  gstreamer1-plugins-bad-free gstreamer1-rtsp-server-devel \
+  gstreamer1-plugins-bad-freeworld gstreamer1-libav
 ```
 
-## 2. Build & Test Without DeckLink Hardware
+## 2. Build, Install & Add KDE Launcher
 ```bash
 cd apps/transmitter
-cargo run -- --test-pattern --rtsp-url "rtsp://seance_ingest:secret@127.0.0.1:8554/cleanfeed"
+cargo install --path .
+bash install-desktop.sh
+```
+Settings (RTSP URL, DeckLink device #, SDI mode, bitrate, and optional PNG/JPG Privacy Slate path) persist automatically to `~/.config/seance-transmitter/config.json`. Closing the window sends a clean EOS flush before setting GStreamer to `Null` so `libDeckLinkAPI.so` always releases the PCIe card cleanly.
+
+## 3. Test Without DeckLink Hardware
+```bash
+seance-transmitter --test-pattern --rtsp-url "rtsp://seance_ingest:secret@127.0.0.1:8554/cleanfeed"
 ```
 
-## 3. Stream Deck / OpenDeck Webhook
+## 4. Stream Deck / OpenDeck Webhook
 While running, the transmitter exposes a local HTTP control endpoint on `127.0.0.1:9944`:
 - `http://127.0.0.1:9944/toggle` — toggle stream ON/OFF (sends clean EOS before releasing DeckLink)
 - `http://127.0.0.1:9944/slate` — toggle Privacy Slate ON/OFF without dropping the RTSP connection
-- `http://127.0.0.1:9944/status` — JSON telemetry snapshot
+- `http://127.0.0.1:9944/status` — JSON telemetry snapshot (includes `outbound_mbps`, `actual_fps`, `uptime_secs`)

@@ -2,6 +2,9 @@ use crate::config::{TelemetrySnapshot, TransmitterConfig};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_video as _;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -13,6 +16,7 @@ pub enum PipelineCommand {
     ToggleStream(TransmitterConfig),
     SetSlate(bool),
     ToggleSlate,
+    Shutdown(SyncSender<()>),
 }
 
 struct ActivePipeline {
@@ -23,6 +27,10 @@ struct ActivePipeline {
     v_pad_slate: gst::Pad,
     a_pad_live: gst::Pad,
     a_pad_slate: gst::Pad,
+    probe_bytes: Arc<AtomicU64>,
+    probe_frames: Arc<AtomicU64>,
+    started_at: tokio::time::Instant,
+    slate_mode: String,
 }
 
 impl ActivePipeline {
@@ -69,6 +77,81 @@ fn first_available_factory<'a>(candidates: &[&'a str]) -> Option<&'a str> {
         }
     }
     None
+}
+
+fn build_slate_video_branch(
+    pipeline: &gst::Pipeline,
+    slate_image_path: &str,
+    v_slate_caps: &gst::Element,
+) -> Result<String, String> {
+    let trimmed = slate_image_path.trim();
+    if !trimmed.is_empty() && Path::new(trimmed).is_file() {
+        let ext = Path::new(trimmed)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let decoder_factory = match ext.as_str() {
+            "png" => Some("pngdec"),
+            "jpg" | "jpeg" => Some("jpegdec"),
+            _ => None,
+        };
+
+        if let Some(dec_name) = decoder_factory
+            && gst::ElementFactory::find(dec_name).is_some()
+            && gst::ElementFactory::find("imagefreeze").is_some()
+        {
+            let filesrc = make_elem("filesrc", "slate_file_src")?;
+            filesrc.set_property("location", trimmed);
+            let dec = make_elem(dec_name, "slate_img_dec")?;
+            let freeze = make_elem("imagefreeze", "slate_freeze")?;
+            freeze.set_property("is-live", true);
+            let conv = make_elem("videoconvert", "v_slate_conv")?;
+            let scale = make_elem("videoscale", "v_slate_scale")?;
+
+            pipeline
+                .add_many([&filesrc, &dec, &freeze, &conv, &scale, v_slate_caps])
+                .map_err(|e| format!("Failed to add image slate elements: {e}"))?;
+            gst::Element::link_many([&filesrc, &dec, &freeze, &conv, &scale, v_slate_caps])
+                .map_err(|e| format!("Failed to link image slate branch: {e}"))?;
+
+            return Ok(format!("Custom Image ({})", Path::new(trimmed).file_name().and_then(|n| n.to_str()).unwrap_or("slate")));
+        }
+    }
+
+    // Default black slate with centered text overlay
+    let v_slate_src = make_elem("videotestsrc", "slate_v_src")?;
+    v_slate_src.set_property("is-live", true);
+    v_slate_src.set_property_from_str("pattern", "black");
+
+    let v_slate_overlay = gst::ElementFactory::make("textoverlay")
+        .name("slate_text")
+        .build()
+        .ok();
+    if let Some(ref ov) = v_slate_overlay {
+        ov.set_property("text", "GRADING SETUP — STAND BY");
+        ov.set_property_from_str("valignment", "center");
+        ov.set_property_from_str("halignment", "center");
+        ov.set_property_from_str("font-desc", "Sans Bold 36");
+    }
+
+    let v_slate_conv = make_elem("videoconvert", "v_slate_conv")?;
+    pipeline
+        .add_many([&v_slate_src, &v_slate_conv, v_slate_caps])
+        .map_err(|e| format!("Failed to add default slate elements: {e}"))?;
+
+    if let Some(ref ov) = v_slate_overlay {
+        pipeline
+            .add(ov)
+            .map_err(|e| format!("Failed to add textoverlay: {e}"))?;
+        gst::Element::link_many([&v_slate_src, ov, &v_slate_conv, v_slate_caps])
+            .map_err(|e| format!("Failed to link slate video branch: {e}"))?;
+    } else {
+        gst::Element::link_many([&v_slate_src, &v_slate_conv, v_slate_caps])
+            .map_err(|e| format!("Failed to link slate video branch: {e}"))?;
+    }
+
+    Ok("Default Text Slate".to_string())
 }
 
 fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActivePipeline, String> {
@@ -127,23 +210,7 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
             .build(),
     );
 
-    // --- Branch B: Hold / Privacy Slate ---
-    let v_slate_src = make_elem("videotestsrc", "slate_v_src")?;
-    v_slate_src.set_property("is-live", true);
-    v_slate_src.set_property_from_str("pattern", "black");
-
-    let v_slate_overlay = gst::ElementFactory::make("textoverlay")
-        .name("slate_text")
-        .build()
-        .ok();
-    if let Some(ref ov) = v_slate_overlay {
-        ov.set_property("text", "GRADING SETUP — STAND BY");
-        ov.set_property_from_str("valignment", "center");
-        ov.set_property_from_str("halignment", "center");
-        ov.set_property_from_str("font-desc", "Sans Bold 36");
-    }
-
-    let v_slate_conv = make_elem("videoconvert", "v_slate_conv")?;
+    // --- Branch B: Hold / Privacy Slate (Custom PNG/JPG or Default Text Slate) ---
     let v_slate_caps = make_elem("capsfilter", "v_slate_caps")?;
     v_slate_caps.set_property(
         "caps",
@@ -155,6 +222,7 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
             .field("colorimetry", "bt709")
             .build(),
     );
+    let slate_mode = build_slate_video_branch(&pipeline, &cfg.slate_image_path, &v_slate_caps)?;
 
     let a_slate_src = make_elem("audiotestsrc", "slate_a_src")?;
     a_slate_src.set_property("is-live", true);
@@ -174,9 +242,9 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     let audio_sel = make_elem("input-selector", "audio_sel")?;
 
     // --- 10-bit HEVC NVENC Encode + AAC + RTSP-over-TCP Sink ---
-    // Lock resolution/fps before nvh265enc so caps changes from DeckLink or
-    // input-selector never trigger gst_nv_encoder_reset() inside libnvidia-encode.
-    let v_enc_conv = make_elem("videoconvert", "v_enc_conv")?;
+    // Both branches already convert to P010_10LE bt709 before video_sel, avoiding
+    // a redundant second CPU videoconvert pass (significant savings at 4K).
+    // videoscale + videorate lock resolution/fps so nvh265enc never resets mid-stream.
     let v_enc_scale = make_elem("videoscale", "v_enc_scale")?;
     let v_enc_rate = make_elem("videorate", "v_enc_rate")?;
     let v_enc_caps = make_elem("capsfilter", "v_enc_caps")?;
@@ -196,7 +264,7 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     let v_enc = make_elem(nvenc_factory, "hevc_enc")?;
     v_enc.set_property("bitrate", cfg.bitrate_mbps * 1000);
     v_enc.set_property_from_str("rc-mode", "cbr");
-    v_enc.set_property("gop-size", 24i32);
+    v_enc.set_property("gop-size", cfg.sdi_mode.gop_size());
     v_enc.set_property("zerolatency", true);
 
     let h265_caps = make_elem("capsfilter", "h265_caps")?;
@@ -210,6 +278,21 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     let h265_parse = make_elem("h265parse", "h265_parse")?;
     h265_parse.set_property("config-interval", -1i32);
 
+    // Lightweight pad probe for live outbound Mbps & FPS telemetry
+    let probe_bytes = Arc::new(AtomicU64::new(0));
+    let probe_frames = Arc::new(AtomicU64::new(0));
+    if let Some(src_pad) = h265_parse.static_pad("src") {
+        let bytes_counter = probe_bytes.clone();
+        let frames_counter = probe_frames.clone();
+        src_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+            if let Some(gst::PadProbeData::Buffer(ref buf)) = info.data {
+                bytes_counter.fetch_add(buf.size() as u64, Ordering::Relaxed);
+                frames_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
     let aac_factory = first_available_factory(&["voaacenc", "fdkaacenc", "avenc_aac"])
         .ok_or_else(|| "Missing AAC encoder (`voaacenc`, `fdkaacenc`, or `avenc_aac`)".to_string())?;
     let a_enc = make_elem(aac_factory, "aac_enc")?;
@@ -220,7 +303,7 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     sink.set_property("location", &cfg.rtsp_url);
     sink.set_property_from_str("protocols", "tcp");
 
-    // Add all elements to pipeline
+    // Add remaining elements to pipeline (v_slate_* already added by build_slate_video_branch)
     pipeline
         .add_many([
             &v_live_src,
@@ -230,15 +313,11 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
             &a_live_conv,
             &a_live_resamp,
             &a_live_caps,
-            &v_slate_src,
-            &v_slate_conv,
-            &v_slate_caps,
             &a_slate_src,
             &a_slate_conv,
             &a_slate_caps,
             &video_sel,
             &audio_sel,
-            &v_enc_conv,
             &v_enc_scale,
             &v_enc_rate,
             &v_enc_caps,
@@ -251,26 +330,13 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
         ])
         .map_err(|e| format!("Failed to add elements to pipeline: {e}"))?;
 
-    if let Some(ref ov) = v_slate_overlay {
-        pipeline
-            .add(ov)
-            .map_err(|e| format!("Failed to add textoverlay: {e}"))?;
-    }
-
     // Link Branch A
     gst::Element::link_many([&v_live_src, &v_live_conv, &v_live_caps])
         .map_err(|e| format!("Failed to link live video branch: {e}"))?;
     gst::Element::link_many([&a_live_src, &a_live_conv, &a_live_resamp, &a_live_caps])
         .map_err(|e| format!("Failed to link live audio branch: {e}"))?;
 
-    // Link Branch B
-    if let Some(ref ov) = v_slate_overlay {
-        gst::Element::link_many([&v_slate_src, ov, &v_slate_conv, &v_slate_caps])
-            .map_err(|e| format!("Failed to link slate video branch: {e}"))?;
-    } else {
-        gst::Element::link_many([&v_slate_src, &v_slate_conv, &v_slate_caps])
-            .map_err(|e| format!("Failed to link slate video branch: {e}"))?;
-    }
+    // Link Branch B audio
     gst::Element::link_many([&a_slate_src, &a_slate_conv, &a_slate_caps])
         .map_err(|e| format!("Failed to link slate audio branch: {e}"))?;
 
@@ -312,7 +378,6 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     // Link selectors -> encoders -> rtspclientsink
     gst::Element::link_many([
         &video_sel,
-        &v_enc_conv,
         &v_enc_scale,
         &v_enc_rate,
         &v_enc_caps,
@@ -334,6 +399,10 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
         v_pad_slate,
         a_pad_live,
         a_pad_slate,
+        probe_bytes,
+        probe_frames,
+        started_at: tokio::time::Instant::now(),
+        slate_mode,
     };
     active.set_slate(slate_active);
 
@@ -343,6 +412,16 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
         .map_err(|e| format!("Failed to set pipeline to Playing: {e}"))?;
 
     Ok(active)
+}
+
+fn reset_stopped_telemetry(t: &mut TelemetrySnapshot) {
+    t.streaming = false;
+    t.pipeline_state = "Null".to_string();
+    t.negotiated_caps = "—".to_string();
+    t.outbound_mbps = 0.0;
+    t.actual_fps = 0.0;
+    t.uptime_secs = 0;
+    t.reconnect_attempt = 0;
 }
 
 pub async fn run_pipeline_manager(
@@ -356,6 +435,7 @@ pub async fn run_pipeline_manager(
     let mut current_cfg = initial_cfg;
     let mut reconnect_attempt: u32 = 0;
     let mut next_reconnect: Option<tokio::time::Instant> = None;
+    let mut last_stats_at = tokio::time::Instant::now();
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
 
@@ -373,16 +453,19 @@ pub async fn run_pipeline_manager(
                         }
                         match build_pipeline(&current_cfg, slate_active) {
                             Ok(p) => {
+                                let slate_mode = p.slate_mode.clone();
                                 active = Some(p);
+                                last_stats_at = tokio::time::Instant::now();
                                 let mut t = telemetry.lock().unwrap();
                                 t.streaming = true;
+                                t.slate_mode = slate_mode;
                                 t.pipeline_state = "Playing".to_string();
                                 t.last_error = None;
                                 t.reconnect_attempt = 0;
                             }
                             Err(err) => {
                                 let mut t = telemetry.lock().unwrap();
-                                t.streaming = false;
+                                reset_stopped_telemetry(&mut t);
                                 t.pipeline_state = "Error".to_string();
                                 t.last_error = Some(err);
                             }
@@ -396,10 +479,7 @@ pub async fn run_pipeline_manager(
                             prev.stop_cleanly();
                         }
                         let mut t = telemetry.lock().unwrap();
-                        t.streaming = false;
-                        t.pipeline_state = "Null".to_string();
-                        t.negotiated_caps = "—".to_string();
-                        t.reconnect_attempt = 0;
+                        reset_stopped_telemetry(&mut t);
                     }
                     PipelineCommand::ToggleStream(cfg) => {
                         if desired_streaming {
@@ -409,24 +489,25 @@ pub async fn run_pipeline_manager(
                                 prev.stop_cleanly();
                             }
                             let mut t = telemetry.lock().unwrap();
-                            t.streaming = false;
-                            t.pipeline_state = "Null".to_string();
-                            t.negotiated_caps = "—".to_string();
+                            reset_stopped_telemetry(&mut t);
                         } else {
                             current_cfg = cfg;
                             desired_streaming = true;
                             reconnect_attempt = 0;
                             match build_pipeline(&current_cfg, slate_active) {
                                 Ok(p) => {
+                                    let slate_mode = p.slate_mode.clone();
                                     active = Some(p);
+                                    last_stats_at = tokio::time::Instant::now();
                                     let mut t = telemetry.lock().unwrap();
                                     t.streaming = true;
+                                    t.slate_mode = slate_mode;
                                     t.pipeline_state = "Playing".to_string();
                                     t.last_error = None;
                                 }
                                 Err(err) => {
                                     let mut t = telemetry.lock().unwrap();
-                                    t.streaming = false;
+                                    reset_stopped_telemetry(&mut t);
                                     t.pipeline_state = "Error".to_string();
                                     t.last_error = Some(err);
                                 }
@@ -447,10 +528,17 @@ pub async fn run_pipeline_manager(
                         }
                         telemetry.lock().unwrap().slate_active = slate_active;
                     }
+                    PipelineCommand::Shutdown(done_tx) => {
+                        if let Some(prev) = active.take() {
+                            prev.stop_cleanly();
+                        }
+                        let _ = done_tx.send(());
+                        break;
+                    }
                 }
             }
             _ = tick.tick() => {
-                // Poll GStreamer bus messages & negotiated caps
+                // Poll GStreamer bus messages, negotiated caps, and live Mbps/FPS
                 let mut bus_error: Option<String> = None;
                 if let Some(ref p) = active {
                     if let Some(bus) = p.pipeline.bus() {
@@ -479,6 +567,18 @@ pub async fn run_pipeline_manager(
                     {
                         telemetry.lock().unwrap().negotiated_caps = caps.to_string();
                     }
+
+                    let now = tokio::time::Instant::now();
+                    let elapsed = now.duration_since(last_stats_at).as_secs_f64();
+                    if elapsed >= 1.0 {
+                        let bytes = p.probe_bytes.swap(0, Ordering::Relaxed);
+                        let frames = p.probe_frames.swap(0, Ordering::Relaxed);
+                        last_stats_at = now;
+                        let mut t = telemetry.lock().unwrap();
+                        t.outbound_mbps = (bytes as f64 * 8.0) / (elapsed * 1_000_000.0);
+                        t.actual_fps = frames as f64 / elapsed;
+                        t.uptime_secs = p.started_at.elapsed().as_secs();
+                    }
                 }
 
                 if let Some(err) = bus_error {
@@ -490,6 +590,9 @@ pub async fn run_pipeline_manager(
                     next_reconnect = Some(tokio::time::Instant::now() + Duration::from_secs(backoff_secs));
                     let mut t = telemetry.lock().unwrap();
                     t.streaming = false;
+                    t.outbound_mbps = 0.0;
+                    t.actual_fps = 0.0;
+                    t.uptime_secs = 0;
                     t.pipeline_state = format!("Reconnecting in {backoff_secs}s");
                     t.reconnect_attempt = reconnect_attempt;
                     t.last_error = Some(err);
@@ -500,9 +603,12 @@ pub async fn run_pipeline_manager(
                     next_reconnect = None;
                     match build_pipeline(&current_cfg, slate_active) {
                         Ok(p) => {
+                            let slate_mode = p.slate_mode.clone();
                             active = Some(p);
+                            last_stats_at = tokio::time::Instant::now();
                             let mut t = telemetry.lock().unwrap();
                             t.streaming = true;
+                            t.slate_mode = slate_mode;
                             t.pipeline_state = "Playing".to_string();
                             t.last_error = None;
                         }
