@@ -1,4 +1,4 @@
-use crate::config::{TelemetrySnapshot, TransmitterConfig};
+use crate::config::{SdiMode, TelemetrySnapshot, TransmitterConfig};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_video as _;
@@ -49,17 +49,34 @@ impl ActivePipeline {
         self.audio_sel.set_property("active-pad", a_target);
     }
 
-    /// Sends EOS so `libDeckLinkAPI.so` flushes and releases the PCIe device cleanly
-    /// before transitioning the pipeline to `Null`.
+    /// Sends EOS only when the pipeline has actually reached `Playing` so
+    /// `libDeckLinkAPI.so` flushes and releases the PCIe device cleanly without
+    /// deadlocking on a broken or mid-preroll pipeline.
     fn stop_cleanly(self) {
-        let _ = self.pipeline.send_event(gst::event::Eos::new());
-        if let Some(bus) = self.pipeline.bus() {
-            let _ = bus.timed_pop_filtered(
-                Some(gst::ClockTime::from_mseconds(1500)),
-                &[gst::MessageType::Eos, gst::MessageType::Error],
-            );
+        if self.pipeline.current_state() == gst::State::Playing {
+            let _ = self.pipeline.send_event(gst::event::Eos::new());
+            if let Some(bus) = self.pipeline.bus() {
+                let _ = bus.timed_pop_filtered(
+                    Some(gst::ClockTime::from_mseconds(1500)),
+                    &[gst::MessageType::Eos, gst::MessageType::Error],
+                );
+            }
         }
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+
+    /// Immediate teardown to `Null` without sending EOS — used on bus errors
+    /// where streaming threads or `rtspclientsink` are already failing/prerolling.
+    fn stop_immediately(self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+impl Drop for ActivePipeline {
+    fn drop(&mut self) {
+        if self.pipeline.current_state() != gst::State::Null {
+            let _ = self.pipeline.set_state(gst::State::Null);
+        }
     }
 }
 
@@ -68,6 +85,17 @@ fn make_elem(factory: &str, name: &str) -> Result<gst::Element, String> {
         .name(name)
         .build()
         .map_err(|e| format!("Missing GStreamer element `{factory}`: {e}"))
+}
+
+fn make_queue(name: &str, max_buffers: u32, leaky: bool) -> Result<gst::Element, String> {
+    let q = make_elem("queue", name)?;
+    q.set_property("max-size-buffers", max_buffers);
+    q.set_property("max-size-bytes", 0u32);
+    q.set_property("max-size-time", 0u64);
+    if leaky {
+        q.set_property_from_str("leaky", "downstream");
+    }
+    Ok(q)
 }
 
 fn first_available_factory<'a>(candidates: &[&'a str]) -> Option<&'a str> {
@@ -79,11 +107,100 @@ fn first_available_factory<'a>(candidates: &[&'a str]) -> Option<&'a str> {
     None
 }
 
+fn build_live_video_branch(
+    pipeline: &gst::Pipeline,
+    cfg: &TransmitterConfig,
+    v_live_caps: &gst::Element,
+) -> Result<(), String> {
+    let (width, height, fps_n, fps_d) = cfg.sdi_mode.dimensions_and_fps();
+    let v_live_q = make_queue("v_live_q", 3, true)?;
+
+    if cfg.test_pattern {
+        let v_live_src = make_elem("videotestsrc", "test_v_src")?;
+        v_live_src.set_property("is-live", true);
+        v_live_src.set_property_from_str("pattern", "smpte");
+
+        let v_live_conv = make_elem("videoconvert", "v_live_conv")?;
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "P010_10LE")
+            .field("width", width)
+            .field("height", height)
+            .field("framerate", gst::Fraction::new(fps_n, fps_d))
+            .field("colorimetry", "bt709")
+            .build();
+        v_live_caps.set_property("caps", &caps);
+
+        pipeline
+            .add_many([&v_live_src, &v_live_q, &v_live_conv, v_live_caps])
+            .map_err(|e| format!("Failed to add test video elements: {e}"))?;
+        gst::Element::link_many([&v_live_src, &v_live_q, &v_live_conv, v_live_caps])
+            .map_err(|e| format!("Failed to link test video branch: {e}"))?;
+        return Ok(());
+    }
+
+    // Live DeckLink SDI capture.
+    // `video-format=10bit-yuv` (v210) is locked for explicit modes; `auto` is required
+    // when `mode=auto` per GStreamer's decklinkvideosrc documentation.
+    let v_live_src = make_elem("decklinkvideosrc", "dl_v_src")?;
+    v_live_src.set_property("device-number", cfg.device_number);
+    v_live_src.set_property_from_str("connection", "sdi");
+    v_live_src.set_property_from_str("mode", cfg.sdi_mode.decklink_mode_str());
+    let video_fmt = if cfg.sdi_mode == SdiMode::Auto {
+        "auto"
+    } else {
+        "10bit-yuv"
+    };
+    v_live_src.set_property_from_str("video-format", video_fmt);
+
+    // Step v210 (packed 10-bit 4:2:2, 128-byte aligned stride) -> I422_10LE (planar 10-bit 4:2:2)
+    // -> P010_10LE (semi-planar 10-bit 4:2:0) to avoid direct v210->P010 stride/padding edge
+    // cases in libgstvideoconvertscale.
+    let v_live_conv1 = make_elem("videoconvert", "v_live_conv1")?;
+    let v_live_mid_caps = make_elem("capsfilter", "v_live_mid_caps")?;
+    v_live_mid_caps.set_property(
+        "caps",
+        &gst::Caps::builder("video/x-raw")
+            .field("format", "I422_10LE")
+            .build(),
+    );
+    let v_live_conv2 = make_elem("videoconvert", "v_live_conv2")?;
+    v_live_caps.set_property(
+        "caps",
+        &gst::Caps::builder("video/x-raw")
+            .field("format", "P010_10LE")
+            .field("colorimetry", "bt709")
+            .build(),
+    );
+
+    pipeline
+        .add_many([
+            &v_live_src,
+            &v_live_q,
+            &v_live_conv1,
+            &v_live_mid_caps,
+            &v_live_conv2,
+            v_live_caps,
+        ])
+        .map_err(|e| format!("Failed to add live SDI video elements: {e}"))?;
+    gst::Element::link_many([
+        &v_live_src,
+        &v_live_q,
+        &v_live_conv1,
+        &v_live_mid_caps,
+        &v_live_conv2,
+        v_live_caps,
+    ])
+    .map_err(|e| format!("Failed to link live SDI video branch: {e}"))?;
+
+    Ok(())
+}
+
 fn build_slate_video_branch(
     pipeline: &gst::Pipeline,
     slate_image_path: &str,
     v_slate_caps: &gst::Element,
 ) -> Result<String, String> {
+    let v_slate_q = make_queue("v_slate_q", 2, true)?;
     let trimmed = slate_image_path.trim();
     if !trimmed.is_empty() && Path::new(trimmed).is_file() {
         let ext = Path::new(trimmed)
@@ -110,12 +227,18 @@ fn build_slate_video_branch(
             let scale = make_elem("videoscale", "v_slate_scale")?;
 
             pipeline
-                .add_many([&filesrc, &dec, &freeze, &conv, &scale, v_slate_caps])
+                .add_many([&filesrc, &dec, &freeze, &conv, &scale, &v_slate_q, v_slate_caps])
                 .map_err(|e| format!("Failed to add image slate elements: {e}"))?;
-            gst::Element::link_many([&filesrc, &dec, &freeze, &conv, &scale, v_slate_caps])
+            gst::Element::link_many([&filesrc, &dec, &freeze, &conv, &scale, &v_slate_q, v_slate_caps])
                 .map_err(|e| format!("Failed to link image slate branch: {e}"))?;
 
-            return Ok(format!("Custom Image ({})", Path::new(trimmed).file_name().and_then(|n| n.to_str()).unwrap_or("slate")));
+            return Ok(format!(
+                "Custom Image ({})",
+                Path::new(trimmed)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("slate")
+            ));
         }
     }
 
@@ -137,17 +260,17 @@ fn build_slate_video_branch(
 
     let v_slate_conv = make_elem("videoconvert", "v_slate_conv")?;
     pipeline
-        .add_many([&v_slate_src, &v_slate_conv, v_slate_caps])
+        .add_many([&v_slate_src, &v_slate_conv, &v_slate_q, v_slate_caps])
         .map_err(|e| format!("Failed to add default slate elements: {e}"))?;
 
     if let Some(ref ov) = v_slate_overlay {
         pipeline
             .add(ov)
             .map_err(|e| format!("Failed to add textoverlay: {e}"))?;
-        gst::Element::link_many([&v_slate_src, ov, &v_slate_conv, v_slate_caps])
+        gst::Element::link_many([&v_slate_src, ov, &v_slate_conv, &v_slate_q, v_slate_caps])
             .map_err(|e| format!("Failed to link slate video branch: {e}"))?;
     } else {
-        gst::Element::link_many([&v_slate_src, &v_slate_conv, v_slate_caps])
+        gst::Element::link_many([&v_slate_src, &v_slate_conv, &v_slate_q, v_slate_caps])
             .map_err(|e| format!("Failed to link slate video branch: {e}"))?;
     }
 
@@ -159,46 +282,22 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     let (width, height, fps_n, fps_d) = cfg.sdi_mode.dimensions_and_fps();
 
     // --- Branch A: Live SDI (or --test-pattern) ---
-    let (v_live_src, a_live_src) = if cfg.test_pattern {
-        let v = make_elem("videotestsrc", "test_v_src")?;
-        v.set_property("is-live", true);
-        v.set_property_from_str("pattern", "smpte");
+    let v_live_caps = make_elem("capsfilter", "v_live_caps")?;
+    build_live_video_branch(&pipeline, cfg, &v_live_caps)?;
 
+    let a_live_src = if cfg.test_pattern {
         let a = make_elem("audiotestsrc", "test_a_src")?;
         a.set_property("is-live", true);
         a.set_property_from_str("wave", "ticks");
         a.set_property("volume", 0.08_f64);
-        (v, a)
+        a
     } else {
-        let v = make_elem("decklinkvideosrc", "dl_v_src")?;
-        v.set_property("device-number", cfg.device_number);
-        v.set_property_from_str("connection", "sdi");
-        v.set_property_from_str("mode", cfg.sdi_mode.decklink_mode_str());
-
         let a = make_elem("decklinkaudiosrc", "dl_a_src")?;
         a.set_property("device-number", cfg.device_number);
-        (v, a)
+        a
     };
 
-    let v_live_conv = make_elem("videoconvert", "v_live_conv")?;
-    let v_live_caps = make_elem("capsfilter", "v_live_caps")?;
-    if cfg.test_pattern {
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("format", "P010_10LE")
-            .field("width", width)
-            .field("height", height)
-            .field("framerate", gst::Fraction::new(fps_n, fps_d))
-            .field("colorimetry", "bt709")
-            .build();
-        v_live_caps.set_property("caps", &caps);
-    } else {
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("format", "P010_10LE")
-            .field("colorimetry", "bt709")
-            .build();
-        v_live_caps.set_property("caps", &caps);
-    }
-
+    let a_live_q = make_queue("a_live_q", 8, true)?;
     let a_live_conv = make_elem("audioconvert", "a_live_conv")?;
     let a_live_resamp = make_elem("audioresample", "a_live_resamp")?;
     let a_live_caps = make_elem("capsfilter", "a_live_caps")?;
@@ -227,6 +326,7 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     let a_slate_src = make_elem("audiotestsrc", "slate_a_src")?;
     a_slate_src.set_property("is-live", true);
     a_slate_src.set_property_from_str("wave", "silence");
+    let a_slate_q = make_queue("a_slate_q", 8, true)?;
     let a_slate_conv = make_elem("audioconvert", "a_slate_conv")?;
     let a_slate_caps = make_elem("capsfilter", "a_slate_caps")?;
     a_slate_caps.set_property(
@@ -238,13 +338,22 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     );
 
     // --- Input Selectors ---
+    // Disable sync-streams & cache-buffers so inactive live branches drop frames
+    // immediately without stalling or deadlocking DeckLink capture threads.
     let video_sel = make_elem("input-selector", "video_sel")?;
+    video_sel.set_property("sync-streams", false);
+    video_sel.set_property("cache-buffers", false);
+
     let audio_sel = make_elem("input-selector", "audio_sel")?;
+    audio_sel.set_property("sync-streams", false);
+    audio_sel.set_property("cache-buffers", false);
 
     // --- 10-bit HEVC NVENC Encode + AAC + RTSP-over-TCP Sink ---
     // Both branches already convert to P010_10LE bt709 before video_sel, avoiding
     // a redundant second CPU videoconvert pass (significant savings at 4K).
-    // videoscale + videorate lock resolution/fps so nvh265enc never resets mid-stream.
+    // Queues decouple selector threads from encoders/RTSP; videoscale + videorate
+    // lock resolution/fps so nvh265enc never resets mid-stream.
+    let v_enc_q = make_queue("v_enc_q", 4, false)?;
     let v_enc_scale = make_elem("videoscale", "v_enc_scale")?;
     let v_enc_rate = make_elem("videorate", "v_enc_rate")?;
     let v_enc_caps = make_elem("capsfilter", "v_enc_caps")?;
@@ -293,6 +402,7 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
         });
     }
 
+    let a_enc_q = make_queue("a_enc_q", 16, false)?;
     let aac_factory = first_available_factory(&["voaacenc", "fdkaacenc", "avenc_aac"])
         .ok_or_else(|| "Missing AAC encoder (`voaacenc`, `fdkaacenc`, or `avenc_aac`)".to_string())?;
     let a_enc = make_elem(aac_factory, "aac_enc")?;
@@ -303,41 +413,46 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     sink.set_property("location", &cfg.rtsp_url);
     sink.set_property_from_str("protocols", "tcp");
 
-    // Add remaining elements to pipeline (v_slate_* already added by build_slate_video_branch)
+    // Add remaining elements to pipeline (v_live_* and v_slate_* already added by helpers)
     pipeline
         .add_many([
-            &v_live_src,
-            &v_live_conv,
-            &v_live_caps,
             &a_live_src,
+            &a_live_q,
             &a_live_conv,
             &a_live_resamp,
             &a_live_caps,
             &a_slate_src,
+            &a_slate_q,
             &a_slate_conv,
             &a_slate_caps,
             &video_sel,
             &audio_sel,
+            &v_enc_q,
             &v_enc_scale,
             &v_enc_rate,
             &v_enc_caps,
             &v_enc,
             &h265_caps,
             &h265_parse,
+            &a_enc_q,
             &a_enc,
             &aac_parse,
             &sink,
         ])
         .map_err(|e| format!("Failed to add elements to pipeline: {e}"))?;
 
-    // Link Branch A
-    gst::Element::link_many([&v_live_src, &v_live_conv, &v_live_caps])
-        .map_err(|e| format!("Failed to link live video branch: {e}"))?;
-    gst::Element::link_many([&a_live_src, &a_live_conv, &a_live_resamp, &a_live_caps])
-        .map_err(|e| format!("Failed to link live audio branch: {e}"))?;
+    // Link Branch A audio
+    gst::Element::link_many([
+        &a_live_src,
+        &a_live_q,
+        &a_live_conv,
+        &a_live_resamp,
+        &a_live_caps,
+    ])
+    .map_err(|e| format!("Failed to link live audio branch: {e}"))?;
 
     // Link Branch B audio
-    gst::Element::link_many([&a_slate_src, &a_slate_conv, &a_slate_caps])
+    gst::Element::link_many([&a_slate_src, &a_slate_q, &a_slate_conv, &a_slate_caps])
         .map_err(|e| format!("Failed to link slate audio branch: {e}"))?;
 
     // Request selector sink pads and link branches
@@ -375,9 +490,10 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
         .link(&a_pad_slate)
         .map_err(|e| format!("Link slate audio -> selector failed: {e}"))?;
 
-    // Link selectors -> encoders -> rtspclientsink
+    // Link selectors -> queues -> encoders -> rtspclientsink
     gst::Element::link_many([
         &video_sel,
+        &v_enc_q,
         &v_enc_scale,
         &v_enc_rate,
         &v_enc_caps,
@@ -388,7 +504,7 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     ])
     .map_err(|e| format!("Failed to link video encode -> rtspclientsink: {e}"))?;
 
-    gst::Element::link_many([&audio_sel, &a_enc, &aac_parse, &sink])
+    gst::Element::link_many([&audio_sel, &a_enc_q, &a_enc, &aac_parse, &sink])
         .map_err(|e| format!("Failed to link audio encode -> rtspclientsink: {e}"))?;
 
     let active = ActivePipeline {
@@ -406,10 +522,10 @@ fn build_pipeline(cfg: &TransmitterConfig, slate_active: bool) -> Result<ActiveP
     };
     active.set_slate(slate_active);
 
-    active
-        .pipeline
-        .set_state(gst::State::Playing)
-        .map_err(|e| format!("Failed to set pipeline to Playing: {e}"))?;
+    if let Err(e) = active.pipeline.set_state(gst::State::Playing) {
+        let _ = active.pipeline.set_state(gst::State::Null);
+        return Err(format!("Failed to set pipeline to Playing: {e}"));
+    }
 
     Ok(active)
 }
@@ -545,11 +661,28 @@ pub async fn run_pipeline_manager(
                         while let Some(msg) = bus.pop() {
                             match msg.view() {
                                 gst::MessageView::Error(err) => {
-                                    bus_error = Some(format!(
-                                        "{}: {}",
+                                    let src_name = err
+                                        .src()
+                                        .map(|s| s.name().to_string())
+                                        .unwrap_or_else(|| "pipeline".to_string());
+                                    let msg_text = format!(
+                                        "[{src_name}] {}: {}",
                                         err.error(),
                                         err.debug().unwrap_or_default()
-                                    ));
+                                    );
+                                    eprintln!("[seance-transmitter] GStreamer ERROR: {msg_text}");
+                                    bus_error = Some(msg_text);
+                                }
+                                gst::MessageView::Warning(warn) => {
+                                    let src_name = warn
+                                        .src()
+                                        .map(|s| s.name().to_string())
+                                        .unwrap_or_else(|| "pipeline".to_string());
+                                    eprintln!(
+                                        "[seance-transmitter] GStreamer WARNING [{src_name}]: {} ({})",
+                                        warn.error(),
+                                        warn.debug().unwrap_or_default()
+                                    );
                                 }
                                 gst::MessageView::StateChanged(sc) => {
                                     if sc.src().map(|s| s == &p.pipeline).unwrap_or(false) {
@@ -583,7 +716,7 @@ pub async fn run_pipeline_manager(
 
                 if let Some(err) = bus_error {
                     if let Some(prev) = active.take() {
-                        prev.stop_cleanly();
+                        prev.stop_immediately();
                     }
                     reconnect_attempt = reconnect_attempt.saturating_add(1);
                     let backoff_secs = (1u64 << reconnect_attempt.min(4)).min(15);
