@@ -42,7 +42,9 @@ export type ClientMessage =
 			role: string;
 			inZoom: boolean;
 	  }
+	| { type: 'rename'; userName: string }
 	| { type: 'chat'; text: string }
+	| { type: 'stroke_progress'; stroke: DrawingStroke }
 	| { type: 'stroke_add'; stroke: DrawingStroke }
 	| { type: 'stroke_undo'; strokeId?: string }
 	| { type: 'stroke_clear' };
@@ -57,6 +59,8 @@ export type ServerMessage =
 	  }
 	| { type: 'presence'; participants: Participant[] }
 	| { type: 'chat'; message: ChatMessage }
+	| { type: 'stroke_progress'; stroke: DrawingStroke }
+	| { type: 'stroke_progress_end'; userId: string }
 	| { type: 'stroke_add'; stroke: DrawingStroke }
 	| { type: 'stroke_undo'; strokeId?: string; userId: string }
 	| { type: 'stroke_clear'; userId: string }

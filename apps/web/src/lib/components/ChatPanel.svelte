@@ -1,15 +1,56 @@
 <script lang="ts">
 	import type { ChatMessage, Participant } from '$lib/shared/protocol';
+	import { tick } from 'svelte';
 
 	interface Props {
 		participants: Participant[];
 		messages: ChatMessage[];
 		connected: boolean;
+		userName: string;
+		canEditName: boolean;
+		onRename: (nextName: string) => void;
 		onSendChat: (text: string) => void;
 	}
 
-	let { participants, messages, connected, onSendChat }: Props = $props();
+	let {
+		participants,
+		messages,
+		connected,
+		userName,
+		canEditName,
+		onRename,
+		onSendChat
+	}: Props = $props();
+
 	let draft = $state('');
+	let nameDraft = $state('');
+	let messagesEl: HTMLDivElement | undefined = $state();
+
+	$effect(() => {
+		nameDraft = userName;
+	});
+
+	$effect(() => {
+		const count = messages.length;
+		if (count === 0 || !messagesEl) return;
+		const distanceFromBottom =
+			messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+		const shouldScroll = distanceFromBottom < 120 || count <= 1;
+		void tick().then(() => {
+			if (messagesEl && shouldScroll) {
+				messagesEl.scrollTop = messagesEl.scrollHeight;
+			}
+		});
+	});
+
+	function commitRename() {
+		const cleaned = nameDraft.trim().slice(0, 64);
+		if (cleaned && cleaned !== userName) {
+			onRename(cleaned);
+		} else {
+			nameDraft = userName;
+		}
+	}
 
 	function submit(e: SubmitEvent) {
 		e.preventDefault();
@@ -17,6 +58,11 @@
 		if (!text) return;
 		onSendChat(text);
 		draft = '';
+		void tick().then(() => {
+			if (messagesEl) {
+				messagesEl.scrollTop = messagesEl.scrollHeight;
+			}
+		});
 	}
 </script>
 
@@ -24,9 +70,30 @@
 	<div class="panel-header">
 		<span class="title">Room Session</span>
 		<span class="ws-badge" class:ws-ok={connected}>
-			{connected ? 'WS Connected' : 'Reconnecting...'}
+			{connected ? 'WS Connected' : 'Reconnecting…'}
 		</span>
 	</div>
+
+	{#if canEditName}
+		<div class="name-bar">
+			<label for="display-name-input">You:</label>
+			<input
+				id="display-name-input"
+				type="text"
+				bind:value={nameDraft}
+				maxlength="64"
+				placeholder="Your name"
+				onblur={commitRename}
+				onkeydown={(e) => {
+					if (e.key === 'Enter') {
+						e.preventDefault();
+						commitRename();
+						(e.currentTarget as HTMLInputElement).blur();
+					}
+				}}
+			/>
+		</div>
+	{/if}
 
 	<div class="participants">
 		{#each participants as p (p.userId)}
@@ -37,7 +104,7 @@
 		{/each}
 	</div>
 
-	<div class="messages">
+	<div class="messages" bind:this={messagesEl}>
 		{#if messages.length === 0}
 			<div class="empty">No notes yet. Draw on the frame or send a message below.</div>
 		{/if}
@@ -56,7 +123,7 @@
 		<input
 			type="text"
 			bind:value={draft}
-			placeholder="Add grading note..."
+			placeholder="Add grading note…"
 			disabled={!connected}
 		/>
 		<button type="submit" disabled={!connected || !draft.trim()}>Send</button>
@@ -101,6 +168,27 @@
 	.ws-badge.ws-ok {
 		background: #133524;
 		color: #6ee7b7;
+	}
+
+	.name-bar {
+		display: flex;
+		align-items: center;
+		gap: 0.45rem;
+		padding: 0.45rem 0.75rem;
+		border-bottom: 1px solid #1e232d;
+		background: #0e1116;
+		font-size: 0.75rem;
+		color: #94a3b8;
+	}
+
+	.name-bar input {
+		flex: 1;
+		background: #141820;
+		color: #f1f5f9;
+		border: 1px solid #262e3d;
+		border-radius: 4px;
+		padding: 0.25rem 0.5rem;
+		font-size: 0.78rem;
 	}
 
 	.participants {

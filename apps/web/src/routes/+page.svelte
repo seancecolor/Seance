@@ -20,6 +20,8 @@
 
 	let { data, form }: { data: PageData; form: ActionData } = $props();
 
+	const NAME_STORAGE_KEY = 'seance_user_name';
+
 	let zoom = $state<ZoomBridgeState>({
 		inZoom: false,
 		runningContext: 'browser',
@@ -28,11 +30,12 @@
 	});
 
 	let userId = $state<string>(crypto.randomUUID());
-	let userName = $state('Colorist / Client');
+	let userName = $state('Colorist');
 	let wsConnected = $state(false);
 	let participants = $state<Participant[]>([]);
 	let messages = $state<ChatMessage[]>([]);
 	let strokes = $state<DrawingStroke[]>([]);
+	let remotePreviews = $state<Record<string, DrawingStroke>>({});
 	let copied = $state(false);
 
 	let ws: WebSocket | null = null;
@@ -69,11 +72,21 @@
 				participants = msg.participants;
 				messages = msg.messages;
 				strokes = msg.strokes;
+				remotePreviews = {};
 			} else if (msg.type === 'presence') {
 				participants = msg.participants;
 			} else if (msg.type === 'chat') {
 				messages = [...messages, msg.message];
+			} else if (msg.type === 'stroke_progress') {
+				remotePreviews = { ...remotePreviews, [msg.stroke.userId]: msg.stroke };
+			} else if (msg.type === 'stroke_progress_end') {
+				const next = { ...remotePreviews };
+				delete next[msg.userId];
+				remotePreviews = next;
 			} else if (msg.type === 'stroke_add') {
+				const next = { ...remotePreviews };
+				delete next[msg.stroke.userId];
+				remotePreviews = next;
 				strokes = [...strokes, msg.stroke];
 			} else if (msg.type === 'stroke_undo') {
 				if (msg.strokeId) {
@@ -81,6 +94,7 @@
 				}
 			} else if (msg.type === 'stroke_clear') {
 				strokes = [];
+				remotePreviews = {};
 			}
 		};
 
@@ -90,6 +104,10 @@
 				reconnectTimer = setTimeout(connectWebSocket, 1500);
 			}
 		};
+	}
+
+	function handleStrokeProgress(stroke: DrawingStroke) {
+		sendWs({ type: 'stroke_progress', stroke });
 	}
 
 	function handleAddStroke(stroke: DrawingStroke) {
@@ -103,7 +121,18 @@
 
 	function handleClearStrokes() {
 		strokes = [];
+		remotePreviews = {};
 		sendWs({ type: 'stroke_clear' });
+	}
+
+	function handleRename(nextName: string) {
+		userName = nextName;
+		try {
+			localStorage.setItem(NAME_STORAGE_KEY, nextName);
+		} catch {
+			// Ignore storage errors in private browsing
+		}
+		sendWs({ type: 'rename', userName: nextName });
 	}
 
 	function handleSendChat(text: string) {
@@ -128,6 +157,13 @@
 			if (bridge.user) {
 				userId = bridge.user.participantUUID;
 				userName = bridge.user.screenName;
+			} else {
+				const fallback = data.role === 'host' ? 'Colorist' : 'Client';
+				try {
+					userName = localStorage.getItem(NAME_STORAGE_KEY)?.trim() || fallback;
+				} catch {
+					userName = fallback;
+				}
 			}
 			connectWebSocket();
 		})();
@@ -219,8 +255,10 @@
 				<VideoPlayer
 					hlsUrl={data.hlsUrl!}
 					{strokes}
+					{remotePreviews}
 					{userId}
 					{userName}
+					onStrokeProgress={handleStrokeProgress}
 					onAddStroke={handleAddStroke}
 					onUndoStroke={handleUndoStroke}
 					onClearStrokes={handleClearStrokes}
@@ -232,6 +270,9 @@
 					{participants}
 					{messages}
 					connected={wsConnected}
+					{userName}
+					canEditName={!zoom.inZoom}
+					onRename={handleRename}
 					onSendChat={handleSendChat}
 				/>
 			</section>

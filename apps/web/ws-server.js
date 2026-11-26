@@ -5,14 +5,17 @@ import { isAuthEnforced, verifyRequestSession } from './session-auth.js';
  * @typedef {import('node:events').EventEmitter} EventEmitter
  * @typedef {import('node:http').IncomingMessage} IncomingMessage
  * @typedef {import('node:stream').Duplex} Duplex
- * @typedef {import('ws').WebSocket} WsSocket
+ * @typedef {import('ws').WebSocket & { isAlive?: boolean }} WsSocket
  * @typedef {import('./session-auth.js').SessionPayload} SessionPayload
  * @typedef {{ clients: Map<WsSocket, any>, messages: any[], strokes: any[] }} RoomState
  */
 
+const HEARTBEAT_INTERVAL_MS = 25_000;
+
 /**
  * Shared WebSocket room server for chat, presence, and normalized (0.0..1.0)
- * telestration strokes. Used by both `vite.config.ts` (dev) and `server.js` (prod).
+ * telestration strokes (including live stroke previews). Used by both
+ * `vite.config.ts` (dev) and `server.js` (prod).
  * Enforces signed `seance_session` cookie on upgrade and pins each socket to its
  * authorized room.
  * @param {EventEmitter & { __seanceWssAttached?: boolean }} httpServer
@@ -83,7 +86,7 @@ export function attachSeanceWebSocketServer(httpServer) {
 		const width =
 			typeof rawStroke.width === 'number' && Number.isFinite(rawStroke.width)
 				? Math.min(0.05, Math.max(0.001, rawStroke.width))
-				: 0.004;
+				: 0.0045;
 
 		return {
 			id: String(rawStroke.id || crypto.randomUUID()).slice(0, 64),
@@ -96,6 +99,29 @@ export function attachSeanceWebSocketServer(httpServer) {
 					: undefined
 		};
 	}
+
+	// 25s ping/pong heartbeat keeps connections alive through Railway's edge proxy
+	// and prunes dead/ghost participants cleanly.
+	const heartbeat = setInterval(() => {
+		for (const client of wss.clients) {
+			const ws = /** @type {WsSocket} */ (client);
+			if (ws.isAlive === false) {
+				ws.terminate();
+				continue;
+			}
+			ws.isAlive = false;
+			try {
+				ws.ping();
+			} catch {
+				ws.terminate();
+			}
+		}
+	}, HEARTBEAT_INTERVAL_MS);
+	heartbeat.unref();
+
+	httpServer.on('close', () => {
+		clearInterval(heartbeat);
+	});
 
 	httpServer.on(
 		'upgrade',
@@ -127,6 +153,11 @@ export function attachSeanceWebSocketServer(httpServer) {
 			/** @type {IncomingMessage} */ _req,
 			/** @type {SessionPayload | null} */ session
 		) => {
+			ws.isAlive = true;
+			ws.on('pong', () => {
+				ws.isAlive = true;
+			});
+
 			/** @type {string | null} */
 			let currentRoomId = null;
 			/** @type {any} */
@@ -142,7 +173,6 @@ export function attachSeanceWebSocketServer(httpServer) {
 				}
 
 				if (msg.type === 'join') {
-					// Pin roomId to verified session cookie whenever auth is enforced
 					const roomId = session
 						? session.roomId
 						: String(msg.roomId || 'seance-studio').slice(0, 128);
@@ -158,7 +188,7 @@ export function attachSeanceWebSocketServer(httpServer) {
 					currentRoomId = roomId;
 					currentUser = {
 						userId: String(msg.userId || crypto.randomUUID()).slice(0, 64),
-						userName: String(msg.userName || 'Guest').slice(0, 64),
+						userName: String(msg.userName || 'Guest').trim().slice(0, 64) || 'Guest',
 						role: session ? session.role : String(msg.role || 'attendee').slice(0, 32),
 						inZoom: Boolean(msg.inZoom)
 					};
@@ -186,7 +216,13 @@ export function attachSeanceWebSocketServer(httpServer) {
 
 				const room = getRoom(currentRoomId);
 
-				if (msg.type === 'chat') {
+				if (msg.type === 'rename') {
+					const nextName = String(msg.userName || '').trim().slice(0, 64);
+					if (!nextName || nextName === currentUser.userName) return;
+					currentUser = { ...currentUser, userName: nextName };
+					room.clients.set(ws, currentUser);
+					broadcast(room, { type: 'presence', participants: listParticipants(room) });
+				} else if (msg.type === 'chat') {
 					const text = String(msg.text || '').trim().slice(0, 2000);
 					if (!text) return;
 					const chatMessage = {
@@ -199,6 +235,16 @@ export function attachSeanceWebSocketServer(httpServer) {
 					room.messages.push(chatMessage);
 					if (room.messages.length > 500) room.messages.shift();
 					broadcast(room, { type: 'chat', message: chatMessage });
+				} else if (msg.type === 'stroke_progress' && msg.stroke) {
+					const clean = sanitizeStroke(msg.stroke);
+					if (!clean) return;
+					const stroke = {
+						...clean,
+						userId: currentUser.userId,
+						userName: currentUser.userName,
+						timestamp: Date.now()
+					};
+					broadcast(room, { type: 'stroke_progress', stroke }, ws);
 				} else if (msg.type === 'stroke_add' && msg.stroke) {
 					const clean = sanitizeStroke(msg.stroke);
 					if (!clean) return;
@@ -240,6 +286,9 @@ export function attachSeanceWebSocketServer(httpServer) {
 					const room = rooms.get(currentRoomId);
 					if (room) {
 						room.clients.delete(ws);
+						if (currentUser) {
+							broadcast(room, { type: 'stroke_progress_end', userId: currentUser.userId });
+						}
 						broadcast(room, { type: 'presence', participants: listParticipants(room) });
 						if (room.clients.size === 0 && room.messages.length === 0 && room.strokes.length === 0) {
 							rooms.delete(currentRoomId);
