@@ -1,6 +1,6 @@
 [package]
 name = "seance-transmitter"
-version = "1.1.5"
+version = "1.1.6"
 edition = "2024"
 description = "Seance local Linux 10-bit DeckLink -> GStreamer NVENC HEVC -> RTSP-over-TCP transmitter GUI"
 
