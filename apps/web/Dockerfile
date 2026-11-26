@@ -19,6 +19,7 @@ COPY --from=builder /app/build ./build
 COPY --from=builder /app/server.js ./
 COPY --from=builder /app/ws-server.js ./
 COPY --from=builder /app/hls-proxy.js ./
+COPY --from=builder /app/session-auth.js ./
 
 EXPOSE 3000
 CMD ["node", "server.js"]

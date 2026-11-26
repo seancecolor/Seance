@@ -1,0 +1,62 @@
+{
+  "display_information": {
+    "display_name": "Seance",
+    "description": "10-bit reference color grading viewer with live telestration and chat.",
+    "long_description": "Seance delivers a color-accurate 10-bit BT.709 HEVC Low-Latency HLS reference feed directly inside Zoom meetings alongside frame-locked canvas telestration and session chat."
+  },
+  "oauth_information": {
+    "usage": "USER_OPERATION",
+    "development_redirect_uri": "https://seance.visitantmedia.com",
+    "production_redirect_uri": "https://seance.visitantmedia.com",
+    "oauth_allow_list": [
+      "https://seance.visitantmedia.com"
+    ],
+    "strict_mode": false,
+    "subdomain_strict_mode": false,
+    "scopes": [
+      {
+        "scope": "zoomapp:inmeeting",
+        "optional": false
+      }
+    ],
+    "scope_description": "Required to launch Seance inside live Zoom meetings."
+  },
+  "features": {
+    "products": [
+      "ZOOM_MEETING"
+    ],
+    "development_home_uri": "https://seance.visitantmedia.com",
+    "production_home_uri": "https://seance.visitantmedia.com",
+    "domain_allow_list": [
+      {
+        "domain": "seance.visitantmedia.com",
+        "explanation": "Seance web app, WebSocket room server, and same-origin HLS proxy."
+      }
+    ],
+    "in_client_feature": {
+      "zoom_app_api": {
+        "enable": true,
+        "zoom_app_apis": [
+          "getRunningContext",
+          "getUserContext",
+          "startCollaborate",
+          "endCollaborate",
+          "appPopout",
+          "openUrl",
+          "onCollaborateChange"
+        ]
+      },
+      "guest_mode": {
+        "enable": true,
+        "enable_test_guest_mode": true
+      },
+      "collaborate_mode": {
+        "enable": true,
+        "enable_screen_sharing": false,
+        "enable_play_together": false,
+        "enable_start_immediately": false,
+        "enable_join_immediately": true
+      }
+    }
+  }
+}

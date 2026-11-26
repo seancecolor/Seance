@@ -1,23 +1,27 @@
 import { WebSocketServer } from 'ws';
+import { isAuthEnforced, verifyRequestSession } from './session-auth.js';
 
 /**
  * @typedef {import('node:events').EventEmitter} EventEmitter
  * @typedef {import('node:http').IncomingMessage} IncomingMessage
  * @typedef {import('node:stream').Duplex} Duplex
  * @typedef {import('ws').WebSocket} WsSocket
+ * @typedef {import('./session-auth.js').SessionPayload} SessionPayload
  * @typedef {{ clients: Map<WsSocket, any>, messages: any[], strokes: any[] }} RoomState
  */
 
 /**
  * Shared WebSocket room server for chat, presence, and normalized (0.0..1.0)
  * telestration strokes. Used by both `vite.config.ts` (dev) and `server.js` (prod).
+ * Enforces signed `seance_session` cookie on upgrade and pins each socket to its
+ * authorized room.
  * @param {EventEmitter & { __seanceWssAttached?: boolean }} httpServer
  */
 export function attachSeanceWebSocketServer(httpServer) {
 	if (httpServer.__seanceWssAttached) return;
 	httpServer.__seanceWssAttached = true;
 
-	const wss = new WebSocketServer({ noServer: true });
+	const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
 
 	/** @type {Map<string, RoomState>} */
 	const rooms = new Map();
@@ -51,130 +55,198 @@ export function attachSeanceWebSocketServer(httpServer) {
 		return Array.from(room.clients.values());
 	}
 
+	/** @param {any} rawStroke */
+	function sanitizeStroke(rawStroke) {
+		if (!rawStroke || !Array.isArray(rawStroke.points) || rawStroke.points.length === 0) {
+			return null;
+		}
+		const points = rawStroke.points
+			.slice(0, 2000)
+			.filter(
+				(/** @type {any} */ p) =>
+					p &&
+					typeof p.x === 'number' &&
+					typeof p.y === 'number' &&
+					Number.isFinite(p.x) &&
+					Number.isFinite(p.y)
+			)
+			.map((/** @type {any} */ p) => ({
+				x: Math.min(1, Math.max(0, p.x)),
+				y: Math.min(1, Math.max(0, p.y))
+			}));
+		if (points.length === 0) return null;
+
+		const color =
+			typeof rawStroke.color === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(rawStroke.color)
+				? rawStroke.color
+				: '#ff3b30';
+		const width =
+			typeof rawStroke.width === 'number' && Number.isFinite(rawStroke.width)
+				? Math.min(0.05, Math.max(0.001, rawStroke.width))
+				: 0.004;
+
+		return {
+			id: String(rawStroke.id || crypto.randomUUID()).slice(0, 64),
+			color,
+			width,
+			points,
+			frameTime:
+				typeof rawStroke.frameTime === 'number' && Number.isFinite(rawStroke.frameTime)
+					? rawStroke.frameTime
+					: undefined
+		};
+	}
+
 	httpServer.on(
 		'upgrade',
 		(/** @type {IncomingMessage} */ req, /** @type {Duplex} */ socket, /** @type {Buffer} */ head) => {
 			const url = new URL(req.url || '/', 'http://localhost');
 			if (url.pathname !== '/ws') return;
 
+			/** @type {SessionPayload | null} */
+			let session = null;
+			if (isAuthEnforced()) {
+				session = verifyRequestSession(req.headers.cookie);
+				if (!session) {
+					socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+					socket.destroy();
+					return;
+				}
+			}
+
 			wss.handleUpgrade(req, socket, head, (ws) => {
-				wss.emit('connection', ws, req);
+				wss.emit('connection', ws, req, session);
 			});
 		}
 	);
 
-	wss.on('connection', (/** @type {WsSocket} */ ws) => {
-		/** @type {string | null} */
-		let currentRoomId = null;
-		/** @type {any} */
-		let currentUser = null;
+	wss.on(
+		'connection',
+		(
+			/** @type {WsSocket} */ ws,
+			/** @type {IncomingMessage} */ _req,
+			/** @type {SessionPayload | null} */ session
+		) => {
+			/** @type {string | null} */
+			let currentRoomId = null;
+			/** @type {any} */
+			let currentUser = null;
 
-		ws.on('message', (raw) => {
-			let msg;
-			try {
-				msg = JSON.parse(raw.toString('utf8'));
-			} catch {
-				ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON payload' }));
-				return;
-			}
-
-			if (msg.type === 'join') {
-				const roomId = String(msg.roomId || 'default').slice(0, 128);
-				if (currentRoomId) {
-					const prev = rooms.get(currentRoomId);
-					if (prev) {
-						prev.clients.delete(ws);
-						broadcast(prev, { type: 'presence', participants: listParticipants(prev) });
-					}
+			ws.on('message', (raw) => {
+				let msg;
+				try {
+					msg = JSON.parse(raw.toString('utf8'));
+				} catch {
+					ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON payload' }));
+					return;
 				}
 
-				currentRoomId = roomId;
-				currentUser = {
-					userId: String(msg.userId || crypto.randomUUID()),
-					userName: String(msg.userName || 'Guest').slice(0, 64),
-					role: String(msg.role || 'attendee'),
-					inZoom: Boolean(msg.inZoom)
-				};
+				if (msg.type === 'join') {
+					// Pin roomId to verified session cookie whenever auth is enforced
+					const roomId = session
+						? session.roomId
+						: String(msg.roomId || 'seance-studio').slice(0, 128);
 
-				const room = getRoom(roomId);
-				room.clients.set(ws, currentUser);
+					if (currentRoomId && currentRoomId !== roomId) {
+						const prev = rooms.get(currentRoomId);
+						if (prev) {
+							prev.clients.delete(ws);
+							broadcast(prev, { type: 'presence', participants: listParticipants(prev) });
+						}
+					}
 
-				ws.send(
-					JSON.stringify({
-						type: 'room_state',
-						roomId,
-						participants: listParticipants(room),
-						messages: room.messages.slice(-200),
-						strokes: room.strokes
-					})
-				);
-				broadcast(room, { type: 'presence', participants: listParticipants(room) }, ws);
-				return;
-			}
+					currentRoomId = roomId;
+					currentUser = {
+						userId: String(msg.userId || crypto.randomUUID()).slice(0, 64),
+						userName: String(msg.userName || 'Guest').slice(0, 64),
+						role: session ? session.role : String(msg.role || 'attendee').slice(0, 32),
+						inZoom: Boolean(msg.inZoom)
+					};
 
-			if (!currentRoomId || !currentUser) {
-				ws.send(JSON.stringify({ type: 'error', message: 'Join a room first' }));
-				return;
-			}
+					const room = getRoom(roomId);
+					room.clients.set(ws, currentUser);
 
-			const room = getRoom(currentRoomId);
+					ws.send(
+						JSON.stringify({
+							type: 'room_state',
+							roomId,
+							participants: listParticipants(room),
+							messages: room.messages.slice(-200),
+							strokes: room.strokes
+						})
+					);
+					broadcast(room, { type: 'presence', participants: listParticipants(room) }, ws);
+					return;
+				}
 
-			if (msg.type === 'chat') {
-				const text = String(msg.text || '').trim().slice(0, 2000);
-				if (!text) return;
-				const chatMessage = {
-					id: crypto.randomUUID(),
-					userId: currentUser.userId,
-					userName: currentUser.userName,
-					text,
-					timestamp: Date.now()
-				};
-				room.messages.push(chatMessage);
-				if (room.messages.length > 500) room.messages.shift();
-				broadcast(room, { type: 'chat', message: chatMessage });
-			} else if (msg.type === 'stroke_add' && msg.stroke) {
-				const stroke = {
-					...msg.stroke,
-					id: String(msg.stroke.id || crypto.randomUUID()),
-					userId: currentUser.userId,
-					userName: currentUser.userName,
-					timestamp: Date.now()
-				};
-				room.strokes.push(stroke);
-				if (room.strokes.length > 1000) room.strokes.shift();
-				broadcast(room, { type: 'stroke_add', stroke }, ws);
-			} else if (msg.type === 'stroke_undo') {
-				let removedId = msg.strokeId;
-				if (removedId) {
-					room.strokes = room.strokes.filter((s) => s.id !== removedId);
-				} else {
-					for (let i = room.strokes.length - 1; i >= 0; i--) {
-						if (room.strokes[i].userId === currentUser.userId) {
-							removedId = room.strokes[i].id;
-							room.strokes.splice(i, 1);
-							break;
+				if (!currentRoomId || !currentUser) {
+					ws.send(JSON.stringify({ type: 'error', message: 'Join a room first' }));
+					return;
+				}
+
+				const room = getRoom(currentRoomId);
+
+				if (msg.type === 'chat') {
+					const text = String(msg.text || '').trim().slice(0, 2000);
+					if (!text) return;
+					const chatMessage = {
+						id: crypto.randomUUID(),
+						userId: currentUser.userId,
+						userName: currentUser.userName,
+						text,
+						timestamp: Date.now()
+					};
+					room.messages.push(chatMessage);
+					if (room.messages.length > 500) room.messages.shift();
+					broadcast(room, { type: 'chat', message: chatMessage });
+				} else if (msg.type === 'stroke_add' && msg.stroke) {
+					const clean = sanitizeStroke(msg.stroke);
+					if (!clean) return;
+					const stroke = {
+						...clean,
+						userId: currentUser.userId,
+						userName: currentUser.userName,
+						timestamp: Date.now()
+					};
+					room.strokes.push(stroke);
+					if (room.strokes.length > 1000) room.strokes.shift();
+					broadcast(room, { type: 'stroke_add', stroke }, ws);
+				} else if (msg.type === 'stroke_undo') {
+					let removedId = typeof msg.strokeId === 'string' ? msg.strokeId : undefined;
+					if (removedId) {
+						room.strokes = room.strokes.filter((s) => s.id !== removedId);
+					} else {
+						for (let i = room.strokes.length - 1; i >= 0; i--) {
+							if (room.strokes[i].userId === currentUser.userId) {
+								removedId = room.strokes[i].id;
+								room.strokes.splice(i, 1);
+								break;
+							}
+						}
+					}
+					broadcast(room, {
+						type: 'stroke_undo',
+						strokeId: removedId,
+						userId: currentUser.userId
+					});
+				} else if (msg.type === 'stroke_clear') {
+					room.strokes = [];
+					broadcast(room, { type: 'stroke_clear', userId: currentUser.userId });
+				}
+			});
+
+			ws.on('close', () => {
+				if (currentRoomId) {
+					const room = rooms.get(currentRoomId);
+					if (room) {
+						room.clients.delete(ws);
+						broadcast(room, { type: 'presence', participants: listParticipants(room) });
+						if (room.clients.size === 0 && room.messages.length === 0 && room.strokes.length === 0) {
+							rooms.delete(currentRoomId);
 						}
 					}
 				}
-				broadcast(room, {
-					type: 'stroke_undo',
-					strokeId: removedId,
-					userId: currentUser.userId
-				});
-			} else if (msg.type === 'stroke_clear') {
-				room.strokes = [];
-				broadcast(room, { type: 'stroke_clear', userId: currentUser.userId });
-			}
-		});
-
-		ws.on('close', () => {
-			if (currentRoomId) {
-				const room = rooms.get(currentRoomId);
-				if (room) {
-					room.clients.delete(ws);
-					broadcast(room, { type: 'presence', participants: listParticipants(room) });
-				}
-			}
-		});
-	});
+			});
+		}
+	);
 }

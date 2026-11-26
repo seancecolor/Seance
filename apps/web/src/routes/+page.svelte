@@ -16,9 +16,9 @@
 		type ZoomBridgeState
 	} from '$lib/zoomBridge';
 	import { onMount } from 'svelte';
-	import type { PageData } from './$types';
+	import type { ActionData, PageData } from './$types';
 
-	let { data }: { data: PageData } = $props();
+	let { data, form }: { data: PageData; form: ActionData } = $props();
 
 	let zoom = $state<ZoomBridgeState>({
 		inZoom: false,
@@ -46,7 +46,7 @@
 	}
 
 	function connectWebSocket() {
-		if (destroyed) return;
+		if (destroyed || !data.authorized || !data.roomId) return;
 		const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 		const socket = new WebSocket(`${proto}//${location.host}/ws`);
 		ws = socket;
@@ -55,10 +55,10 @@
 			wsConnected = true;
 			sendWs({
 				type: 'join',
-				roomId: data.roomId,
+				roomId: data.roomId!,
 				userId,
 				userName,
-				role: zoom.user?.role || 'attendee',
+				role: zoom.user?.role || data.role || 'attendee',
 				inZoom: zoom.inZoom
 			});
 		};
@@ -111,12 +111,15 @@
 	}
 
 	async function copyShareLink() {
+		if (!data.shareUrl) return;
 		await navigator.clipboard.writeText(data.shareUrl);
 		copied = true;
 		setTimeout(() => (copied = false), 2000);
 	}
 
 	onMount(() => {
+		if (!data.authorized) return;
+
 		void (async () => {
 			const bridge = await initZoomBridge((collaborating) => {
 				zoom.collaborating = collaborating;
@@ -137,56 +140,104 @@
 	});
 </script>
 
-<div class="app-layout">
-	<header class="top-bar">
-		<div class="brand">
-			<strong>SEANCE</strong>
-			<span class="room-pill">Room: {data.roomId}</span>
-			<span class="mode-pill">{zoom.inZoom ? 'Zoom App' : 'Standalone Browser'}</span>
+{#if !data.authorized}
+	<div class="lock-shell">
+		<div class="lock-card">
+			<div class="lock-badge">PRIVATE GRADING SUITE</div>
+			<h1>SEANCE</h1>
+			<p class="lock-copy">
+				This session is protected. Clients should open the signed reference link shared in chat or
+				join via Zoom Collaborate.
+			</p>
+
+			<form method="POST" action="?/unlock" class="unlock-form">
+				<label class="field">
+					<span>Session Room</span>
+					<input
+						type="text"
+						name="room"
+						value={form?.room || 'seance-studio'}
+						placeholder="seance-studio"
+						autocomplete="off"
+					/>
+				</label>
+
+				<label class="field">
+					<span>Host Passcode</span>
+					<input
+						type="password"
+						name="passcode"
+						placeholder="Enter host passcode"
+						required
+						autocomplete="current-password"
+					/>
+				</label>
+
+				{#if form?.error}
+					<div class="lock-error">{form.error}</div>
+				{/if}
+
+				<button type="submit" class="unlock-btn">Unlock Session</button>
+			</form>
 		</div>
+	</div>
+{:else}
+	<div class="app-layout">
+		<header class="top-bar">
+			<div class="brand">
+				<strong>SEANCE</strong>
+				<span class="room-pill">Room: {data.roomId}</span>
+				<span class="mode-pill">{zoom.inZoom ? 'Zoom App' : 'Standalone Browser'}</span>
+			</div>
 
-		<div class="top-actions">
-			{#if zoom.inZoom}
-				<button
-					type="button"
-					class="action-btn"
-					onclick={() => (zoom.collaborating ? endZoomCollaborate() : startZoomCollaborate())}
-				>
-					{zoom.collaborating ? 'End Collaborate' : 'Collaborate'}
+			<div class="top-actions">
+				{#if zoom.inZoom}
+					<button
+						type="button"
+						class="action-btn"
+						onclick={() => (zoom.collaborating ? endZoomCollaborate() : startZoomCollaborate())}
+					>
+						{zoom.collaborating ? 'End Collaborate' : 'Collaborate'}
+					</button>
+					<button type="button" class="action-btn" onclick={() => popoutZoomApp()}>
+						Pop Out 1080p
+					</button>
+				{/if}
+				<button type="button" class="action-btn" onclick={copyShareLink}>
+					{copied ? 'Copied Reference Link!' : 'Copy Reference Link'}
 				</button>
-				<button type="button" class="action-btn" onclick={() => popoutZoomApp()}>
-					Pop Out 1080p
-				</button>
-			{/if}
-			<button type="button" class="action-btn" onclick={copyShareLink}>
-				{copied ? 'Copied Reference Link!' : 'Copy Reference Link'}
-			</button>
-		</div>
-	</header>
+				{#if data.role === 'host' && !zoom.inZoom}
+					<form method="POST" action="?/lock" class="inline-form">
+						<button type="submit" class="action-btn action-btn-muted">Lock</button>
+					</form>
+				{/if}
+			</div>
+		</header>
 
-	<main class="workspace">
-		<section class="video-pane">
-			<VideoPlayer
-				hlsUrl={data.hlsUrl}
-				{strokes}
-				{userId}
-				{userName}
-				onAddStroke={handleAddStroke}
-				onUndoStroke={handleUndoStroke}
-				onClearStrokes={handleClearStrokes}
-			/>
-		</section>
+		<main class="workspace">
+			<section class="video-pane">
+				<VideoPlayer
+					hlsUrl={data.hlsUrl!}
+					{strokes}
+					{userId}
+					{userName}
+					onAddStroke={handleAddStroke}
+					onUndoStroke={handleUndoStroke}
+					onClearStrokes={handleClearStrokes}
+				/>
+			</section>
 
-		<section class="side-pane">
-			<ChatPanel
-				{participants}
-				{messages}
-				connected={wsConnected}
-				onSendChat={handleSendChat}
-			/>
-		</section>
-	</main>
-</div>
+			<section class="side-pane">
+				<ChatPanel
+					{participants}
+					{messages}
+					connected={wsConnected}
+					onSendChat={handleSendChat}
+				/>
+			</section>
+		</main>
+	</div>
+{/if}
 
 <style>
 	:global(html, body) {
@@ -196,6 +247,100 @@
 		background: #0b0d10;
 		color: #e2e8f0;
 		font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	}
+
+	.lock-shell {
+		min-height: 100vh;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 1.5rem;
+		box-sizing: border-box;
+	}
+
+	.lock-card {
+		width: 100%;
+		max-width: 390px;
+		background: #11141a;
+		border: 1px solid #1e232d;
+		border-radius: 12px;
+		padding: 1.75rem;
+		box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+	}
+
+	.lock-badge {
+		display: inline-block;
+		font-size: 0.68rem;
+		letter-spacing: 0.08em;
+		padding: 0.2rem 0.5rem;
+		border-radius: 4px;
+		background: #1b202a;
+		color: #94a3b8;
+		margin-bottom: 0.65rem;
+	}
+
+	.lock-card h1 {
+		margin: 0 0 0.5rem 0;
+		font-size: 1.45rem;
+		letter-spacing: 0.06em;
+	}
+
+	.lock-copy {
+		margin: 0 0 1.25rem 0;
+		font-size: 0.85rem;
+		line-height: 1.45;
+		color: #94a3b8;
+	}
+
+	.unlock-form {
+		display: flex;
+		flex-direction: column;
+		gap: 0.85rem;
+	}
+
+	.field {
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+		font-size: 0.78rem;
+		color: #cbd5e1;
+	}
+
+	.field input {
+		background: #0b0d10;
+		color: #f8fafc;
+		border: 1px solid #262e3d;
+		border-radius: 6px;
+		padding: 0.55rem 0.7rem;
+		font-size: 0.88rem;
+	}
+
+	.lock-error {
+		font-size: 0.8rem;
+		color: #fca5a5;
+		background: #3f1d1d;
+		border: 1px solid #7f1d1d;
+		border-radius: 6px;
+		padding: 0.45rem 0.65rem;
+	}
+
+	.unlock-btn {
+		background: #2563eb;
+		color: #fff;
+		border: none;
+		border-radius: 6px;
+		padding: 0.6rem 0.9rem;
+		font-size: 0.88rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.unlock-btn:hover {
+		background: #1d4ed8;
+	}
+
+	.inline-form {
+		margin: 0;
 	}
 
 	.app-layout {
@@ -252,6 +397,10 @@
 
 	.action-btn:hover {
 		background: #28303e;
+	}
+
+	.action-btn-muted {
+		color: #94a3b8;
 	}
 
 	.workspace {
