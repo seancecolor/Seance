@@ -350,17 +350,34 @@
 			});
 
 			hls.on(Hls.Events.ERROR, (_event, data) => {
+				const code = data.response?.code;
+
+				// MediaMTX invalidates its HLS session cookie whenever the publisher restarts,
+				// returning 401 on child playlists (video1_stream.m3u8 / audio2_stream.m3u8).
+				// Reloading the master playlist obtains a fresh MediaMTX session automatically.
+				if (code === 401) {
+					streamState = 'waiting';
+					statusText = 'Reconnecting stream…';
+					scheduleRetry(loadHls, 1500);
+					return;
+				}
+
 				if (!data.fatal) return;
 
-				const code = data.response?.code;
-				if (code === 404 || data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR) {
+				if (
+					code === 404 ||
+					code === 500 ||
+					data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR ||
+					data.details === Hls.ErrorDetails.LEVEL_LOAD_ERROR ||
+					data.details === Hls.ErrorDetails.AUDIO_TRACK_LOAD_ERROR
+				) {
 					streamState = 'waiting';
 					statusText = 'Waiting for signal…';
 					scheduleRetry(loadHls, 2500);
 				} else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
 					streamState = 'waiting';
 					statusText = 'Reconnecting stream…';
-					scheduleRetry(() => hls.startLoad(), 2000);
+					scheduleRetry(loadHls, 2000);
 				} else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
 					statusText = 'Recovering media…';
 					hls.recoverMediaError();
